@@ -10,6 +10,15 @@ another and each sees a fully committed state. Reads use their own
 snapshot transaction, so a query never observes a half-written path:
 paths are *derived* from committed event rows at read time, there is no
 separate path table that could be updated partially.
+
+Loan check-in (``loan_*`` tables) uses the opposite shape deliberately:
+the discrepancy table is *materialized*. A box-count write updates the
+stored count rows and the discrepancy rows in the same transaction, so a
+failed re-evaluation rolls both back and the previous result survives.
+Queries read the stored discrepancy table directly instead of
+recomputing it; the re-evaluation only touches artifacts appearing in
+the box's old/new lists, plus a bulk pending<->shortage flip of still
+missing manifest artifacts when the all-boxes-checked state changes.
 """
 from __future__ import annotations
 
@@ -41,6 +50,60 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     visitor_id  TEXT    NOT NULL PRIMARY KEY,
     withdrawn_at TEXT   NOT NULL
 );
+
+-- =======================================================================
+-- 借展器物到馆点交：发运箱单、逐箱实点清单与物化差异表
+-- =======================================================================
+
+-- 一批借展（一张发运箱单对应一个 batch）。
+CREATE TABLE IF NOT EXISTS loan_batches (
+    batch_id    TEXT    NOT NULL PRIMARY KEY,
+    created_at  TEXT    NOT NULL
+);
+
+-- 发运箱单：每个器物号在一个 batch 内只归一个箱（主键唯一兜底）。
+CREATE TABLE IF NOT EXISTS loan_manifest (
+    batch_id    TEXT    NOT NULL,
+    artifact_id TEXT    NOT NULL,
+    expected_box TEXT   NOT NULL,
+    PRIMARY KEY (batch_id, artifact_id),
+    FOREIGN KEY (batch_id) REFERENCES loan_batches(batch_id)
+);
+
+-- 每个箱最多一份现行实点清单；整份替换（可更正），撤销即删行。
+-- 空清单（items = '[]'）也落行，表示该箱已点且实点为空。
+CREATE TABLE IF NOT EXISTS loan_box_counts (
+    batch_id    TEXT    NOT NULL,
+    box_id      TEXT    NOT NULL,
+    items       TEXT    NOT NULL,
+    updated_at  TEXT    NOT NULL,
+    PRIMARY KEY (batch_id, box_id),
+    FOREIGN KEY (batch_id) REFERENCES loan_batches(batch_id)
+);
+
+-- 物化差异表：查询直接读这张表，不做现场推导。
+-- 与实点清单在同一写事务内一并更新，失败整体回滚、保留原结果。
+CREATE TABLE IF NOT EXISTS loan_discrepancies (
+    batch_id       TEXT    NOT NULL,
+    artifact_id    TEXT    NOT NULL,
+    expected_box   TEXT,
+    observed_boxes TEXT    NOT NULL,  -- JSON 数组；箱内清单去重后的实见箱
+    conclusion     TEXT    NOT NULL CHECK (
+        conclusion IN ('ok', 'conflict', 'misboxed',
+                       'extra', 'pending', 'shortage')
+    ),
+    updated_at     TEXT    NOT NULL,
+    PRIMARY KEY (batch_id, artifact_id),
+    FOREIGN KEY (batch_id) REFERENCES loan_batches(batch_id)
+);
+
+-- 按箱重核与状态批量翻转时的热路径。
+CREATE INDEX IF NOT EXISTS idx_loan_manifest_batch
+    ON loan_manifest (batch_id);
+CREATE INDEX IF NOT EXISTS idx_loan_counts_batch
+    ON loan_box_counts (batch_id);
+CREATE INDEX IF NOT EXISTS idx_loan_discrepancies_batch
+    ON loan_discrepancies (batch_id, conclusion);
 """
 
 
